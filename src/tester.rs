@@ -55,6 +55,7 @@ impl Sandbox {
         }
         fs::create_dir_all(path.join("target"))?;
         fs::create_dir_all(path.join("node_modules"))?;
+        fs::create_dir_all(path.join(".git"))?;
         fs::write(path.join(".gitignore"), "ignored_secret.py\n")?;
         fs::write(
             path.join("ignored_secret.py"),
@@ -72,6 +73,11 @@ impl Sandbox {
         fs::write(path.join("sample.js"), javascript_source())?;
         fs::write(path.join("sample.ts"), typescript_source())?;
         fs::write(path.join("sample.rs"), rust_source())?;
+        fs::write(path.join("sample.go"), go_source())?;
+        fs::write(path.join("sample.java"), java_source())?;
+        fs::write(path.join("sample.cs"), csharp_source())?;
+        fs::write(path.join("sample.php"), php_source())?;
+        fs::write(path.join("sample.rb"), ruby_source())?;
         Ok(Self { path })
     }
 
@@ -154,6 +160,38 @@ fn evaluate(root: &Path, colors: Colors) -> Result<Vec<Check>, SelfTestError> {
         "no files returned",
     );
 
+    let (discovered_config, loaded_cfg_path) = match crate::config::Config::find_and_load(root) {
+        Ok(res) => res,
+        Err(err) => {
+            checks.push(Check {
+                name: "config loader completed".to_string(),
+                passed: false,
+                detail: err.to_string(),
+            });
+            return Err(failure(checks, colors));
+        }
+    };
+    record(
+        &mut checks,
+        "config loader uses defaults when no file present",
+        discovered_config == crate::config::Config::default() && loaded_cfg_path.is_none(),
+        "expected default config with no config path",
+    );
+
+    let custom_cfg_str = "[ignore]\npatterns = [\"CUSTOM_ALLOWLISTED\"]\nfiles = [\"custom_skip.py\"]\n";
+    match crate::config::Config::parse_str(custom_cfg_str, Path::new("dummy.toml")) {
+        Ok(parsed) => {
+            record(
+                &mut checks,
+                "config parser reads ignore rules",
+                parsed.ignore.patterns == vec!["CUSTOM_ALLOWLISTED"]
+                    && parsed.ignore.files == vec!["custom_skip.py"],
+                "parsed config did not match expected rules",
+            );
+        }
+        Err(err) => record(&mut checks, "config parser reads ignore rules", false, &err.to_string()),
+    }
+
     let findings = match detector::detect(&files) {
         Ok(findings) => findings,
         Err(err) => {
@@ -198,7 +236,7 @@ fn evaluate(root: &Path, colors: Colors) -> Result<Vec<Check>, SelfTestError> {
     record(
         &mut checks,
         "dry run predicted rewritten files accurately",
-        dry_run_report.files_rewritten == 4,
+        dry_run_report.files_rewritten == 9,
         &format!("predicted {}", dry_run_report.files_rewritten),
     );
     record(
@@ -226,7 +264,17 @@ fn evaluate(root: &Path, colors: Colors) -> Result<Vec<Check>, SelfTestError> {
         }
     };
 
-    for name in ["sample.py", "sample.js", "sample.ts", "sample.rs"] {
+    for name in [
+        "sample.py",
+        "sample.js",
+        "sample.ts",
+        "sample.rs",
+        "sample.go",
+        "sample.java",
+        "sample.cs",
+        "sample.php",
+        "sample.rb",
+    ] {
         record(
             &mut checks,
             &format!("scanner listed {name}"),
@@ -257,7 +305,17 @@ fn evaluate(root: &Path, colors: Colors) -> Result<Vec<Check>, SelfTestError> {
         "",
     );
 
-    for name in ["sample.py", "sample.js", "sample.ts", "sample.rs"] {
+    for name in [
+        "sample.py",
+        "sample.js",
+        "sample.ts",
+        "sample.rs",
+        "sample.go",
+        "sample.java",
+        "sample.cs",
+        "sample.php",
+        "sample.rb",
+    ] {
         record(
             &mut checks,
             &format!("{name} detected the AWS access key"),
@@ -372,10 +430,53 @@ fn evaluate(root: &Path, colors: Colors) -> Result<Vec<Check>, SelfTestError> {
         Err(err) => record(&mut checks, ".gitignore is readable", false, &err.to_string()),
     }
 
+    match crate::hook::install_hook(root) {
+        Ok(status) => {
+            record(
+                &mut checks,
+                "pre-commit hook installed successfully",
+                status == crate::hook::InstallStatus::Created,
+                &format!("expected Created, got {status:?}"),
+            );
+            let hook_file = root.join(".git").join("hooks").join("pre-commit");
+            let hook_content = fs::read_to_string(&hook_file).unwrap_or_default();
+            record(
+                &mut checks,
+                "pre-commit hook contains SecretSentry check",
+                hook_content.contains(crate::hook::HOOK_MARKER)
+                    && hook_content.contains("detected [1-9][0-9]* secrets"),
+                "hook file did not contain expected content",
+            );
+            let second_status = crate::hook::install_hook(root);
+            record(
+                &mut checks,
+                "pre-commit hook installation is idempotent",
+                second_status.as_ref().map(|s| *s == crate::hook::InstallStatus::AlreadyPresent).unwrap_or(false),
+                &format!("expected AlreadyPresent, got {second_status:?}"),
+            );
+        }
+        Err(err) => {
+            record(&mut checks, "pre-commit hook installed successfully", false, &err.to_string());
+        }
+    }
+
+    let non_git_check = crate::hook::install_hook(&root.join("target"));
+    record(
+        &mut checks,
+        "pre-commit hook rejects non-git directory",
+        matches!(non_git_check, Err(crate::hook::HookError::NotGitRepo { .. })),
+        &format!("expected NotGitRepo error, got {non_git_check:?}"),
+    );
+
     compare_file(&mut checks, root, "sample.py", &python_expected());
     compare_file(&mut checks, root, "sample.js", &javascript_expected());
     compare_file(&mut checks, root, "sample.ts", &typescript_expected());
     compare_file(&mut checks, root, "sample.rs", &rust_expected());
+    compare_file(&mut checks, root, "sample.go", &go_expected());
+    compare_file(&mut checks, root, "sample.java", &java_expected());
+    compare_file(&mut checks, root, "sample.cs", &csharp_expected());
+    compare_file(&mut checks, root, "sample.php", &php_expected());
+    compare_file(&mut checks, root, "sample.rb", &ruby_expected());
     compare_file(
         &mut checks,
         root,
@@ -496,6 +597,8 @@ settings = {{
 fn python_expected() -> String {
     format!(
         "\
+import os
+
 aws_access_key = os.getenv(\"AWS_ACCESS_KEY_ID\")
 openai_token = os.getenv(\"OPENAI_API_KEY\")
 high_entropy = os.getenv(\"HIGH_ENTROPY_SECRET\")
@@ -572,6 +675,119 @@ fn credentials() {
     let openai_token = std::env::var(\"OPENAI_API_KEY\").unwrap();
     let high_entropy = std::env::var(\"HIGH_ENTROPY_SECRET\").unwrap();
 }
+"
+    .to_string()
+}
+
+fn go_source() -> String {
+    format!(
+        "\
+package main
+
+var (
+    awsKey      = \"{AWS_KEY}\"
+    openaiKey   = \"{OPENAI_TOKEN}\"
+    highEntropy = \"{HIGH_ENTROPY}\"
+)
+"
+    )
+}
+
+fn go_expected() -> String {
+    "\
+package main
+
+var (
+    awsKey      = os.Getenv(\"AWS_ACCESS_KEY_ID\")
+    openaiKey   = os.Getenv(\"OPENAI_API_KEY\")
+    highEntropy = os.Getenv(\"HIGH_ENTROPY_SECRET\")
+)
+"
+    .to_string()
+}
+
+fn java_source() -> String {
+    format!(
+        "\
+public class Config {{
+    static final String awsKey      = \"{AWS_KEY}\";
+    static final String openaiKey   = \"{OPENAI_TOKEN}\";
+    static final String highEntropy = \"{HIGH_ENTROPY}\";
+}}
+"
+    )
+}
+
+fn java_expected() -> String {
+    "\
+public class Config {
+    static final String awsKey      = System.getenv(\"AWS_ACCESS_KEY_ID\");
+    static final String openaiKey   = System.getenv(\"OPENAI_API_KEY\");
+    static final String highEntropy = System.getenv(\"HIGH_ENTROPY_SECRET\");
+}
+"
+    .to_string()
+}
+
+fn csharp_source() -> String {
+    format!(
+        "\
+class Config {{
+    string awsKey      = \"{AWS_KEY}\";
+    string openaiKey   = \"{OPENAI_TOKEN}\";
+    string highEntropy = \"{HIGH_ENTROPY}\";
+}}
+"
+    )
+}
+
+fn csharp_expected() -> String {
+    "\
+class Config {
+    string awsKey      = Environment.GetEnvironmentVariable(\"AWS_ACCESS_KEY_ID\");
+    string openaiKey   = Environment.GetEnvironmentVariable(\"OPENAI_API_KEY\");
+    string highEntropy = Environment.GetEnvironmentVariable(\"HIGH_ENTROPY_SECRET\");
+}
+"
+    .to_string()
+}
+
+fn php_source() -> String {
+    format!(
+        "\
+<?php
+$awsKey      = \"{AWS_KEY}\";
+$openaiKey   = \"{OPENAI_TOKEN}\";
+$highEntropy = \"{HIGH_ENTROPY}\";
+"
+    )
+}
+
+fn php_expected() -> String {
+    "\
+<?php
+$awsKey      = getenv(\"AWS_ACCESS_KEY_ID\");
+$openaiKey   = getenv(\"OPENAI_API_KEY\");
+$highEntropy = getenv(\"HIGH_ENTROPY_SECRET\");
+"
+    .to_string()
+}
+
+fn ruby_source() -> String {
+    format!(
+        "\
+aws_key      = \"{AWS_KEY}\"
+openai_key   = \"{OPENAI_TOKEN}\"
+high_entropy = \"{HIGH_ENTROPY}\"
+"
+    )
+}
+
+fn ruby_expected() -> String {
+    "\
+aws_key      = ENV[\"AWS_ACCESS_KEY_ID\"]
+openai_key   = ENV[\"OPENAI_API_KEY\"]
+high_entropy = ENV[\"HIGH_ENTROPY_SECRET\"]
 "
     .to_string()
 }

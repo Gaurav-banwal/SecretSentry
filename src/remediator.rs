@@ -11,6 +11,7 @@ use std::sync::Mutex;
 
 use rayon::prelude::*;
 
+use crate::config::Config;
 use crate::detector::{self, Finding, SecretKind};
 
 #[derive(Debug)]
@@ -114,7 +115,7 @@ impl EnvWriter {
 
 /// Rewrite supported literals and append each distinct secret to `root/.env`.
 pub fn remediate(root: &Path, findings: &[Finding]) -> Result<RemediationReport, RemediateError> {
-    remediate_with_options(root, findings, false)
+    remediate_with_config(root, findings, false, &Config::default())
 }
 
 /// Remediate findings with custom options (such as dry-run).
@@ -122,6 +123,16 @@ pub fn remediate_with_options(
     root: &Path,
     findings: &[Finding],
     dry_run: bool,
+) -> Result<RemediationReport, RemediateError> {
+    remediate_with_config(root, findings, dry_run, &Config::default())
+}
+
+/// Remediate findings with full configuration support.
+pub fn remediate_with_config(
+    root: &Path,
+    findings: &[Finding],
+    dry_run: bool,
+    config: &Config,
 ) -> Result<RemediationReport, RemediateError> {
     let env_path = root.join(".env");
     let env_example_path = root.join(".env.example");
@@ -216,9 +227,16 @@ pub fn remediate_with_options(
             }
         }
 
-        let env_example_keys_written =
-            write_env_example(&env_example_path, &unique_env_keys, true)?;
-        let gitignore_updated = ensure_gitignore_has_env(root, true)?;
+        let env_example_keys_written = if config.remediator.create_env_example {
+            write_env_example(&env_example_path, &unique_env_keys, true)?
+        } else {
+            0
+        };
+        let gitignore_updated = if config.remediator.update_gitignore {
+            ensure_gitignore_has_env(root, true)?
+        } else {
+            false
+        };
 
         return Ok(RemediationReport {
             env_path,
@@ -246,9 +264,16 @@ pub fn remediate_with_options(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .written;
 
-    let env_example_keys_written =
-        write_env_example(&env_example_path, &unique_env_keys, false)?;
-    let gitignore_updated = ensure_gitignore_has_env(root, false)?;
+    let env_example_keys_written = if config.remediator.create_env_example {
+        write_env_example(&env_example_path, &unique_env_keys, false)?
+    } else {
+        0
+    };
+    let gitignore_updated = if config.remediator.update_gitignore {
+        ensure_gitignore_has_env(root, false)?
+    } else {
+        false
+    };
 
     Ok(RemediationReport {
         env_path,
@@ -331,8 +356,13 @@ fn extension_of(path: &Path) -> Option<String> {
 fn env_expression(extension: &str, key: &str) -> Option<String> {
     match extension {
         "rs" => Some(format!("std::env::var(\"{key}\").unwrap()")),
-        "py" => Some(format!("os.getenv(\"{key}\")")),
+        "py" | "pyw" => Some(format!("os.getenv(\"{key}\")")),
         "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" => Some(format!("process.env.{key}")),
+        "go" => Some(format!("os.Getenv(\"{key}\")")),
+        "java" => Some(format!("System.getenv(\"{key}\")")),
+        "cs" => Some(format!("Environment.GetEnvironmentVariable(\"{key}\")")),
+        "php" => Some(format!("getenv(\"{key}\")")),
+        "rb" => Some(format!("ENV[\"{key}\"]")),
         _ => None,
     }
 }
@@ -560,7 +590,95 @@ fn apply_edits(path: &Path, source: &str, edits: &[Planned]) -> Result<String, R
         }
         output.push_str(line.ending);
     }
-    Ok(output)
+    let with_imports = inject_imports(path, &output, edits);
+    Ok(with_imports)
+}
+
+fn already_imports_os(source: &str) -> bool {
+    for line in source.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        if t == "import os" || t.starts_with("import os ") {
+            return true;
+        }
+        if let Some(rest) = t.strip_prefix("import ") {
+            if rest.split(',').any(|pkg| {
+                let pkg_name = pkg.trim().split_whitespace().next().unwrap_or("");
+                pkg_name == "os"
+            }) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn inject_imports(path: &Path, source: &str, edits: &[Planned]) -> String {
+    let ext = extension_of(path).unwrap_or_default();
+    if ext != "py" && ext != "pyw" {
+        return source.to_string();
+    }
+
+    let uses_os_getenv = edits.iter().any(|edit| {
+        edit.replacement
+            .as_deref()
+            .map(|r| r.contains("os.getenv("))
+            .unwrap_or(false)
+    });
+    if !uses_os_getenv {
+        return source.to_string();
+    }
+
+    if already_imports_os(source) {
+        return source.to_string();
+    }
+
+    let nl = if source.contains("\r\n") { "\r\n" } else { "\n" };
+
+    let mut insert_line_idx = 0;
+    for (idx, line) in source.lines().enumerate() {
+        let t = line.trim();
+        if idx == 0 && t.starts_with("#!") {
+            insert_line_idx = idx + 1;
+            continue;
+        }
+        if (idx == 0 || idx == 1) && (t.contains("coding:") || t.contains("coding=")) {
+            insert_line_idx = idx + 1;
+            continue;
+        }
+        break;
+    }
+
+    if insert_line_idx == 0 {
+        if source.is_empty() {
+            format!("import os{nl}")
+        } else {
+            format!("import os{nl}{nl}{source}")
+        }
+    } else {
+        let mut header = String::new();
+        let mut rest = String::new();
+        let mut line_count = 0;
+
+        for line in detector::source_lines(source) {
+            if line_count < insert_line_idx {
+                header.push_str(line.text);
+                header.push_str(line.ending);
+            } else {
+                rest.push_str(line.text);
+                rest.push_str(line.ending);
+            }
+            line_count += 1;
+        }
+
+        if rest.starts_with('\r') || rest.starts_with('\n') {
+            format!("{header}import os{nl}{rest}")
+        } else {
+            format!("{header}{nl}import os{nl}{nl}{rest}")
+        }
+    }
 }
 
 fn replace_spans(
@@ -648,7 +766,35 @@ mod tests {
             env_expression("ts", "HIGH_ENTROPY_SECRET").as_deref(),
             Some("process.env.HIGH_ENTROPY_SECRET")
         );
-        assert_eq!(env_expression("go", "AWS_ACCESS_KEY_ID"), None);
+        assert_eq!(
+            env_expression("go", "AWS_ACCESS_KEY_ID").as_deref(),
+            Some("os.Getenv(\"AWS_ACCESS_KEY_ID\")")
+        );
+    }
+
+    #[test]
+    fn new_language_expressions_match_extensions() {
+        assert_eq!(
+            env_expression("go", "DB_PASSWORD").as_deref(),
+            Some("os.Getenv(\"DB_PASSWORD\")")
+        );
+        assert_eq!(
+            env_expression("java", "DB_PASSWORD").as_deref(),
+            Some("System.getenv(\"DB_PASSWORD\")")
+        );
+        assert_eq!(
+            env_expression("cs", "DB_PASSWORD").as_deref(),
+            Some("Environment.GetEnvironmentVariable(\"DB_PASSWORD\")")
+        );
+        assert_eq!(
+            env_expression("php", "DB_PASSWORD").as_deref(),
+            Some("getenv(\"DB_PASSWORD\")")
+        );
+        assert_eq!(
+            env_expression("rb", "DB_PASSWORD").as_deref(),
+            Some("ENV[\"DB_PASSWORD\"]")
+        );
+        assert_eq!(env_expression("lua", "KEY"), None);
     }
 
     #[test]
@@ -668,6 +814,8 @@ settings = {
         assert_eq!(
             rewritten,
             "\
+import os
+
 # comment = \"AKIAIOSFODNN7EXAMPLE\"
 real = os.getenv(\"AWS_ACCESS_KEY_ID\")
 partial = \"prefix-AKIAIOSFODNN7EXAMPLE\"
@@ -750,5 +898,65 @@ settings = {
         assert!(gitignore.lines().any(|l| l.trim() == ".env"));
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn config_disables_env_example_and_gitignore() {
+        let mut config = Config::default();
+        config.remediator.create_env_example = false;
+        config.remediator.update_gitignore = false;
+
+        let temp_dir = std::env::temp_dir().join("secretsentry_cfg_remediator_test");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let file_path = temp_dir.join("sample.py");
+        let content = "aws_key = \"AKIAIOSFODNN7EXAMPLE\"\n";
+        fs::write(&file_path, content).unwrap();
+
+        let findings = detect_text(&file_path, content);
+        let report = remediate_with_config(&temp_dir, &findings, false, &config).unwrap();
+
+        assert_eq!(report.env_example_keys_written, 0);
+        assert!(!report.gitignore_updated);
+        assert!(!temp_dir.join(".env.example").exists());
+        assert!(!temp_dir.join(".gitignore").exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn injects_import_os_when_missing() {
+        let path = Path::new("test_import.py");
+        let source = "api_key = \"AKIAIOSFODNN7EXAMPLE\"\n";
+        let findings = detect_text(path, source);
+        let rewritten = rewrite_text(path, source, &findings).unwrap();
+        assert_eq!(
+            rewritten,
+            "import os\n\napi_key = os.getenv(\"AWS_ACCESS_KEY_ID\")\n"
+        );
+    }
+
+    #[test]
+    fn does_not_duplicate_existing_import_os() {
+        let path = Path::new("test_existing_import.py");
+        let source = "import os\n\napi_key = \"AKIAIOSFODNN7EXAMPLE\"\n";
+        let findings = detect_text(path, source);
+        let rewritten = rewrite_text(path, source, &findings).unwrap();
+        assert_eq!(
+            rewritten,
+            "import os\n\napi_key = os.getenv(\"AWS_ACCESS_KEY_ID\")\n"
+        );
+    }
+
+    #[test]
+    fn injects_import_os_after_shebang_and_encoding() {
+        let path = Path::new("script.py");
+        let source = "#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\nkey = \"AKIAIOSFODNN7EXAMPLE\"\n";
+        let findings = detect_text(path, source);
+        let rewritten = rewrite_text(path, source, &findings).unwrap();
+        assert_eq!(
+            rewritten,
+            "#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n\nimport os\n\nkey = os.getenv(\"AWS_ACCESS_KEY_ID\")\n"
+        );
     }
 }
