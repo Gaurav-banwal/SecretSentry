@@ -95,7 +95,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     run_pipeline(Path::new(path), dry_run, colors)?;
     Ok(())
 }
-
 fn run_pipeline(
     root: &Path,
     dry_run: bool,
